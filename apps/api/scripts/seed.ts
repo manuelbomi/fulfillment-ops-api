@@ -18,7 +18,7 @@ const pool = new Pool({ connectionString: DATABASE_URL });
 
 const WAREHOUSE_COUNT = 8;
 const SKU_COUNT = 180;
-const ORDER_COUNT = 6000;
+const ORDER_COUNT = 50000;
 const ORDER_HISTORY_DAYS = 180;
 
 const CATEGORIES = [

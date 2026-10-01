@@ -53,6 +53,13 @@ export const analyticsRepository = {
    * Orders not yet shipped whose promised ship date has already passed
    * ("breached") or is within the next 72 hours ("critical"/"at_risk").
    * Uses RANK() to surface, per warehouse, which orders need attention first.
+   *
+   * The predicate is written as `status IN (...)` plus a direct
+   * `promised_ship_date < now() + interval` comparison (rather than
+   * filtering on a derived "hours until due" expression) specifically so
+   * it's sargable against idx_orders_status_promised_ship_date /
+   * idx_orders_status_order_date. See the README's query optimization
+   * section for the before/after EXPLAIN ANALYZE this was measured with.
    */
   async ordersAtRisk(limit: number): Promise<OrderAtRiskRow[]> {
     const result = await query<OrderAtRiskRow>(
@@ -65,11 +72,11 @@ export const analyticsRepository = {
           w.name AS warehouse_name,
           o.status,
           o.promised_ship_date,
-          o.order_date,
-          EXTRACT(EPOCH FROM (o.promised_ship_date - now())) / 3600 AS hours_until_due
+          o.order_date
         FROM orders o
         JOIN warehouses w ON w.id = o.warehouse_id
-        WHERE o.status NOT IN ('shipped', 'delivered', 'cancelled')
+        WHERE o.status IN ('pending', 'processing', 'picked', 'packed')
+          AND o.promised_ship_date < now() + interval '72 hours'
       )
       SELECT
         id,
@@ -79,16 +86,15 @@ export const analyticsRepository = {
         status,
         promised_ship_date,
         order_date,
-        ROUND(hours_until_due::numeric, 1) AS hours_until_due,
+        ROUND((EXTRACT(EPOCH FROM (promised_ship_date - now())) / 3600)::numeric, 1) AS hours_until_due,
         CASE
-          WHEN hours_until_due < 0 THEN 'breached'
-          WHEN hours_until_due < 24 THEN 'critical'
+          WHEN promised_ship_date < now() THEN 'breached'
+          WHEN promised_ship_date < now() + interval '24 hours' THEN 'critical'
           ELSE 'at_risk'
         END AS risk_level,
-        RANK() OVER (PARTITION BY warehouse_id ORDER BY hours_until_due ASC) AS warehouse_urgency_rank
+        RANK() OVER (PARTITION BY warehouse_id ORDER BY promised_ship_date ASC) AS warehouse_urgency_rank
       FROM active_orders
-      WHERE hours_until_due < 72
-      ORDER BY hours_until_due ASC
+      ORDER BY promised_ship_date ASC
       LIMIT $1;
       `,
       [limit],
@@ -132,23 +138,35 @@ export const analyticsRepository = {
   /**
    * SKUs selling below their category's average unit volume, ranked from
    * slowest. Useful for flagging overstock / dead inventory candidates.
+   *
+   * This is deliberately split into two queries instead of one big join:
+   * the first aggregates order_line_items by sku_id only (no join to
+   * orders), which lets Postgres satisfy the GROUP BY straight off
+   * idx_order_line_items_sku_order_covering with an index-only scan and
+   * no sort. Pulling "last ordered at" requires joining to orders, but
+   * doing that for all 180 SKUs up front was what forced a 125k-row sort
+   * that spilled to disk; instead we only look it up for the handful of
+   * SKUs that actually end up in the result. See the README's query
+   * optimization section for the EXPLAIN ANALYZE numbers this is based on.
    */
   async slowMovingSkus(limit: number): Promise<SlowMovingSkuRow[]> {
-    const result = await query<SlowMovingSkuRow>(
+    const result = await query<Omit<SlowMovingSkuRow, "last_ordered_at">>(
       `
-      WITH sku_sales AS (
+      WITH sku_unit_sales AS (
+        SELECT sku_id, SUM(quantity) AS units_sold, COUNT(DISTINCT order_id) AS order_count
+        FROM order_line_items
+        GROUP BY sku_id
+      ),
+      sku_sales AS (
         SELECT
           s.id AS sku_id,
           s.sku_code,
           s.name,
           s.category,
-          COALESCE(SUM(li.quantity), 0) AS units_sold,
-          COUNT(DISTINCT li.order_id) AS order_count,
-          MAX(o.order_date) AS last_ordered_at
+          COALESCE(u.units_sold, 0) AS units_sold,
+          COALESCE(u.order_count, 0) AS order_count
         FROM skus s
-        LEFT JOIN order_line_items li ON li.sku_id = s.id
-        LEFT JOIN orders o ON o.id = li.order_id
-        GROUP BY s.id, s.sku_code, s.name, s.category
+        LEFT JOIN sku_unit_sales u ON u.sku_id = s.id
       ),
       category_stats AS (
         SELECT category, AVG(units_sold) AS avg_units_sold_in_category
@@ -162,7 +180,6 @@ export const analyticsRepository = {
         ss.category,
         ss.units_sold,
         ss.order_count,
-        ss.last_ordered_at,
         ROUND(cs.avg_units_sold_in_category::numeric, 1) AS category_avg_units_sold,
         RANK() OVER (ORDER BY ss.units_sold ASC) AS slow_mover_rank
       FROM sku_sales ss
@@ -173,10 +190,34 @@ export const analyticsRepository = {
       `,
       [limit],
     );
-    return result.rows;
+
+    if (result.rows.length === 0) return [];
+
+    const skuIds = result.rows.map((r) => r.sku_id);
+    const lastOrdered = await query<{ sku_id: number; last_ordered_at: Date }>(
+      `
+      SELECT li.sku_id, MAX(o.order_date) AS last_ordered_at
+      FROM order_line_items li
+      JOIN orders o ON o.id = li.order_id
+      WHERE li.sku_id = ANY($1)
+      GROUP BY li.sku_id;
+      `,
+      [skuIds],
+    );
+    const lastOrderedBySku = new Map(lastOrdered.rows.map((r) => [r.sku_id, r.last_ordered_at]));
+
+    return result.rows.map((row) => ({
+      ...row,
+      last_ordered_at: lastOrderedBySku.get(row.sku_id) ?? null,
+    }));
   },
 
-  /** Current active-order load per warehouse against its stated capacity. */
+  /**
+   * Current in-warehouse order load against stated capacity. "Active" here
+   * means orders that are physically still sitting in the warehouse
+   * (pending/processing/picked/packed) rather than every unfinished order,
+   * since a shipped-but-not-yet-delivered order no longer occupies space.
+   */
   async warehouseCapacity(): Promise<WarehouseCapacityRow[]> {
     const result = await query<WarehouseCapacityRow>(
       `
@@ -185,9 +226,9 @@ export const analyticsRepository = {
         w.code,
         w.name,
         w.capacity_units,
-        COUNT(o.id) FILTER (WHERE o.status NOT IN ('delivered', 'cancelled')) AS active_orders,
+        COUNT(o.id) FILTER (WHERE o.status IN ('pending', 'processing', 'picked', 'packed')) AS active_orders,
         ROUND(
-          100.0 * COUNT(o.id) FILTER (WHERE o.status NOT IN ('delivered', 'cancelled')) / w.capacity_units,
+          100.0 * COUNT(o.id) FILTER (WHERE o.status IN ('pending', 'processing', 'picked', 'packed')) / w.capacity_units,
           1
         ) AS utilization_pct
       FROM warehouses w
