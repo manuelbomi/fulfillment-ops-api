@@ -1,0 +1,40 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: fulfillment-ops-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: fulfillment
+      POSTGRES_PASSWORD: fulfillment
+      POSTGRES_DB: fulfillment_ops
+    ports:
+      # Host port 55432 -> container 5432, since 5432 is already taken by
+      # another local Postgres instance on this machine.
+      - "55432:5432"
+    volumes:
+      - fulfillment_ops_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fulfillment -d fulfillment_ops"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: fulfillment-ops-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      DATABASE_URL: postgresql://fulfillment:fulfillment@db:5432/fulfillment_ops
+      WEB_ORIGIN: http://localhost:5173
+    ports:
+      - "4000:4000"
+
+volumes:
+  fulfillment_ops_pgdata:
