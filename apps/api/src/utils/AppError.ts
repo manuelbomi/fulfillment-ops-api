@@ -13,7 +13,11 @@ export class AppError extends Error {
     this.statusCode = statusCode;
     this.isOperational = true;
     this.details = details;
-    Object.setPrototypeOf(this, AppError.prototype);
+    // Deliberately no explicit Object.setPrototypeOf(this, AppError.prototype)
+    // here: with the compiler targeting ES2020, native class inheritance
+    // already wires up the correct subclass prototype, and forcing it back
+    // to AppError.prototype would break `instanceof ValidationError` etc.
+    // for every subclass.
   }
 }
 

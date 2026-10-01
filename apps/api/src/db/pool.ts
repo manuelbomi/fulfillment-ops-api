@@ -1,6 +1,13 @@
-import { Pool, type PoolClient, type QueryResult, type QueryResultRow } from "pg";
+import { Pool, types, type PoolClient, type QueryResult, type QueryResultRow } from "pg";
 import { env } from "../config/env";
 import { logger } from "../utils/logger";
+
+// node-postgres returns BIGINT/BIGSERIAL (OID 20) columns as strings by
+// default, since they can exceed JS's safe integer range. Every id in this
+// schema is a BIGSERIAL, but we'll never get close to that range at this
+// app's scale, so we parse them as plain numbers to keep ids consistent
+// (and JSON-friendly) everywhere they flow through the API and dashboard.
+types.setTypeParser(20, (value: string) => parseInt(value, 10));
 
 export const pool = new Pool({
   connectionString: env.databaseUrl,
