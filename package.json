@@ -1,0 +1,21 @@
+{
+  "name": "fulfillment-ops-api",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Order fulfillment and logistics analytics platform: Express/TypeScript API over PostgreSQL with a React dashboard.",
+  "workspaces": [
+    "apps/api",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev:api": "npm run dev --workspace apps/api",
+    "dev:web": "npm run dev --workspace apps/web",
+    "migrate": "npm run migrate --workspace apps/api",
+    "seed": "npm run seed --workspace apps/api",
+    "test:api": "npm run test --workspace apps/api",
+    "test:web": "npm run test --workspace apps/web",
+    "build:api": "npm run build --workspace apps/api",
+    "build:web": "npm run build --workspace apps/web"
+  },
+  "license": "MIT"
+}
